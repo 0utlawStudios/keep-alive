@@ -1,0 +1,128 @@
+name: keep-alive
+# Budget-free keep-alive + uptime watchdog. Runs on a PUBLIC repo so it consumes
+# ZERO of the account's 2,000-min private Actions quota (public repos bill nothing).
+# Targets + credentials come from the encrypted KEEPALIVE_TARGETS secret, so this
+# repo exposes no URLs or keys. Hardened: per-target retries, fail-loud, auto-opens
+# a tracking issue, and a monthly heartbeat commit so GitHub never auto-disables the
+# schedule under its 60-day dormancy rule.
+
+on:
+  schedule:
+    - cron: "7 12 * * *" # daily 12:07 UTC (odd minute dodges top-of-hour congestion)
+  workflow_dispatch:
+
+permissions:
+  contents: write # heartbeat commit
+  issues: write # failure alert
+
+concurrency:
+  group: keep-alive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ping all keep-alive targets
+        id: ping
+        env:
+          TARGETS: ${{ secrets.KEEPALIVE_TARGETS }}
+        run: |
+          set -uo pipefail
+          if [ -z "${TARGETS:-}" ]; then
+            echo "::error::KEEPALIVE_TARGETS secret is empty or unset"
+            exit 1
+          fi
+          if ! echo "$TARGETS" | jq -e '.targets | type == "array" and length > 0' >/dev/null 2>&1; then
+            echo "::error::KEEPALIVE_TARGETS is not valid JSON with a non-empty .targets array"
+            exit 1
+          fi
+          n=$(echo "$TARGETS" | jq '.targets | length')
+          echo "Pinging $n target(s)"
+          : > /tmp/failures.md
+          for i in $(seq 0 $((n - 1))); do
+            t=$(echo "$TARGETS" | jq -c ".targets[$i]")
+            name=$(echo "$t" | jq -r '.name')
+            url=$(echo "$t" | jq -r '.url')
+            method=$(echo "$t" | jq -r '.method // "GET"')
+            body=$(echo "$t" | jq -r '.body // ""')
+            hdr_args=()
+            while IFS= read -r h; do
+              [ -n "$h" ] && hdr_args+=( -H "$h" )
+            done < <(echo "$t" | jq -r '.headers // {} | to_entries[] | "\(.key): \(.value)"')
+            args=( --silent --show-error --location --connect-timeout 15 --max-time 45
+                   --retry 5 --retry-delay 10 --retry-all-errors
+                   -o /tmp/resp -w "%{http_code}" -X "$method" )
+            [ -n "$body" ] && args+=( --data "$body" )
+            code=$(curl "${args[@]}" "${hdr_args[@]}" "$url" 2>/tmp/err || echo "000")
+            if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then
+              echo "OK   $name -> HTTP $code"
+            else
+              echo "FAIL $name -> HTTP $code"
+              echo "- **$name**: HTTP $code ($(head -c 160 /tmp/err 2>/dev/null | tr -d '\n'))" >> /tmp/failures.md
+            fi
+          done
+          if [ -s /tmp/failures.md ]; then
+            echo "had_failures=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "had_failures=false" >> "$GITHUB_OUTPUT"
+            echo "All targets healthy."
+          fi
+
+      - name: Monthly heartbeat commit (dodge 60-day auto-disable)
+        if: always()
+        run: |
+          set -uo pipefail
+          last=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+          now=$(date +%s)
+          age_days=$(( (now - last) / 86400 ))
+          if [ "$age_days" -ge 25 ]; then
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > last-heartbeat.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add last-heartbeat.txt
+            git commit -m "chore: keep-alive heartbeat (dodge 60-day workflow auto-disable)"
+            git push
+            echo "Heartbeat committed (last commit was ${age_days}d ago)."
+          else
+            echo "Last commit ${age_days}d ago (<25d); no heartbeat needed."
+          fi
+
+      - name: Open or update a tracking issue if any target failed
+        if: steps.ping.outputs.had_failures == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const failures = fs.readFileSync('/tmp/failures.md', 'utf8').trim();
+            const title = "Keep-alive ping failed";
+            const body = [
+              `One or more keep-alive targets failed (run ${context.runId}).`,
+              ``,
+              failures,
+              ``,
+              `A free-tier Supabase project pauses after ~7 days with no activity. Investigate before the window closes.`,
+              `[Run logs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+            ].join("\n");
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner, repo: context.repo.repo, state: "open", per_page: 100,
+            });
+            const existing = open.find((i) => i.title === title && !i.pull_request);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo, title, body,
+              });
+            }
+
+      - name: Fail the run if any target failed
+        if: steps.ping.outputs.had_failures == 'true'
+        run: |
+          echo "::error::One or more keep-alive targets failed (see the tracking issue and logs above)"
+          exit 1
