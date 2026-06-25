@@ -10,8 +10,9 @@ GitHub Actions minutes, so this watchdog never consumes the account's private
 
 ## Design
 
-- **Targets and credentials** are read from the encrypted `KEEPALIVE_TARGETS` Actions
-  secret. This repository contains no URLs, keys, or tokens.
+- **Targets and credentials** are read from encrypted Actions secrets. `KEEPALIVE_TARGETS`
+  is the base list, and optional `KEEPALIVE_EXTRA_TARGETS` entries are appended at
+  runtime. This repository contains no URLs, keys, or tokens.
 - **Hardened**: each target is retried with backoff; a failed ping fails the run,
   opens or updates a tracking issue, and is visible in the Actions log.
 - **Self-sustaining**: a monthly heartbeat commit keeps the schedule from being
@@ -26,7 +27,9 @@ GitHub Actions minutes, so this watchdog never consumes the account's private
 
 There is no `pull_request` trigger, so forks can never run with these secrets.
 
-## KEEPALIVE_TARGETS shape
+## Target Secret Shape
+
+Use this same shape for `KEEPALIVE_TARGETS` and optional `KEEPALIVE_EXTRA_TARGETS`.
 
 ```json
 { "targets": [ { "name": "app", "method": "GET", "url": "https://...", "headers": { "Authorization": "Bearer ..." }, "body": "" } ] }

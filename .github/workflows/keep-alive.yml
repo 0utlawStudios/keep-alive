@@ -1,10 +1,12 @@
 name: keep-alive
 # Budget-free keep-alive + uptime watchdog. Runs on a PUBLIC repo so it consumes
 # ZERO of the account's 2,000-min private Actions quota (public repos bill nothing).
-# Targets + credentials come from the encrypted KEEPALIVE_TARGETS secret, so this
-# repo exposes no URLs or keys. Hardened: per-target retries, fail-loud, auto-opens
-# a tracking issue, and a monthly heartbeat commit so GitHub never auto-disables the
-# schedule under its 60-day dormancy rule.
+# Targets + credentials come from encrypted Actions secrets, so this repo exposes
+# no URLs or keys. KEEPALIVE_TARGETS is the base list; KEEPALIVE_EXTRA_TARGETS is
+# merged in when present so new targets can be added without replacing the base.
+# Hardened: per-target retries, fail-loud, auto-opens a tracking issue, and a
+# monthly heartbeat commit so GitHub never auto-disables the schedule under its
+# 60-day dormancy rule.
 
 on:
   schedule:
@@ -30,29 +32,44 @@ jobs:
         id: ping
         env:
           TARGETS: ${{ secrets.KEEPALIVE_TARGETS }}
+          EXTRA_TARGETS: ${{ secrets.KEEPALIVE_EXTRA_TARGETS }}
         run: |
           set -uo pipefail
           if [ -z "${TARGETS:-}" ]; then
             echo "::error::KEEPALIVE_TARGETS secret is empty or unset"
             exit 1
           fi
-          if ! echo "$TARGETS" | jq -e '.targets | type == "array" and length > 0' >/dev/null 2>&1; then
+          if ! printf '%s' "$TARGETS" | jq -e '.targets | type == "array" and length > 0' >/dev/null 2>&1; then
             echo "::error::KEEPALIVE_TARGETS is not valid JSON with a non-empty .targets array"
             exit 1
           fi
-          n=$(echo "$TARGETS" | jq '.targets | length')
+          merged_targets="$TARGETS"
+          if [ -n "${EXTRA_TARGETS:-}" ]; then
+            if ! printf '%s' "$EXTRA_TARGETS" | jq -e '.targets | type == "array"' >/dev/null 2>&1; then
+              echo "::error::KEEPALIVE_EXTRA_TARGETS is not valid JSON with a .targets array"
+              exit 1
+            fi
+            merged_targets=$(jq -s -c '{targets: ((.[0].targets // []) + (.[1].targets // []))}' \
+              <(printf '%s' "$TARGETS") \
+              <(printf '%s' "$EXTRA_TARGETS"))
+          fi
+          if ! printf '%s' "$merged_targets" | jq -e '.targets | type == "array" and length > 0' >/dev/null 2>&1; then
+            echo "::error::merged keep-alive target list is empty"
+            exit 1
+          fi
+          n=$(printf '%s' "$merged_targets" | jq '.targets | length')
           echo "Pinging $n target(s)"
           : > /tmp/failures.md
           for i in $(seq 0 $((n - 1))); do
-            t=$(echo "$TARGETS" | jq -c ".targets[$i]")
-            name=$(echo "$t" | jq -r '.name')
-            url=$(echo "$t" | jq -r '.url')
-            method=$(echo "$t" | jq -r '.method // "GET"')
-            body=$(echo "$t" | jq -r '.body // ""')
+            t=$(printf '%s' "$merged_targets" | jq -c ".targets[$i]")
+            name=$(printf '%s' "$t" | jq -r '.name')
+            url=$(printf '%s' "$t" | jq -r '.url')
+            method=$(printf '%s' "$t" | jq -r '.method // "GET"')
+            body=$(printf '%s' "$t" | jq -r '.body // ""')
             hdr_args=()
             while IFS= read -r h; do
               [ -n "$h" ] && hdr_args+=( -H "$h" )
-            done < <(echo "$t" | jq -r '.headers // {} | to_entries[] | "\(.key): \(.value)"')
+            done < <(printf '%s' "$t" | jq -r '.headers // {} | to_entries[] | "\(.key): \(.value)"')
             args=( --silent --show-error --location --connect-timeout 15 --max-time 45
                    --retry 5 --retry-delay 10 --retry-all-errors
                    -o /tmp/resp -w "%{http_code}" -X "$method" )
