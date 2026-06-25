@@ -10,7 +10,7 @@ name: keep-alive
 
 on:
   schedule:
-    - cron: "7 12 * * *" # daily 12:07 UTC (odd minute dodges top-of-hour congestion)
+    - cron: "7 12 */2 * *" # every other day at 12:07 UTC (inside Supabase's 7-day pause window)
   workflow_dispatch:
 
 permissions:
