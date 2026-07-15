@@ -1,0 +1,180 @@
+name: supabase-keepalive
+# Auto-discovery keep-alive for EVERY Supabase project across EVERY account, including
+# future ones. No per-project enrollment: each personal access token in the
+# SUPABASE_ACCESS_TOKENS secret is used to list its account's projects via the
+# Management API, then each ACTIVE_HEALTHY project gets a real `select 1` database
+# query (genuine DB activity that resets the 7-day pause timer). Any project found
+# paused is auto-restored. Runs on this PUBLIC repo so it consumes zero private
+# Actions minutes. Fail-loud: opens/updates a tracking issue and fails the run.
+#
+# SUPABASE_ACCESS_TOKENS shape (one token per Supabase LOGIN, not per project):
+#   { "tokens": ["sbp_xxx", "sbp_yyy"] }
+# New projects created under any listed account are picked up automatically on the
+# next run. The only manual step ever again is adding a token for a brand-new
+# Supabase account. Tokens are account-admin scoped; use dedicated, revocable PATs.
+
+on:
+  schedule:
+    - cron: "17 11 * * *" # daily at 11:17 UTC (own minute, no overlap with keep-alive.yml)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: supabase-keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Discover and keep every Supabase project alive
+        id: run
+        env:
+          TOKENS_JSON: ${{ secrets.SUPABASE_ACCESS_TOKENS }}
+        run: |
+          set -uo pipefail
+          API="https://api.supabase.com/v1"
+
+          if [ -z "${TOKENS_JSON:-}" ]; then
+            echo "::error::SUPABASE_ACCESS_TOKENS secret is empty or unset"
+            exit 1
+          fi
+          if ! printf '%s' "$TOKENS_JSON" | jq -e '.tokens | type == "array" and length > 0' >/dev/null 2>&1; then
+            echo "::error::SUPABASE_ACCESS_TOKENS is not valid JSON with a non-empty .tokens array"
+            exit 1
+          fi
+
+          : > /tmp/failures.md
+          total=0
+          ok=0
+          restored=0
+
+          ntok=$(printf '%s' "$TOKENS_JSON" | jq '.tokens | length')
+          echo "Loaded $ntok access token(s)."
+
+          for ti in $(seq 0 $((ntok - 1))); do
+            tok=$(printf '%s' "$TOKENS_JSON" | jq -r ".tokens[$ti]")
+            acct="account #$((ti + 1))"
+
+            # --- list projects for this account ---
+            list_code=$(curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
+              --retry 4 --retry-delay 8 --retry-all-errors \
+              -o /tmp/projects.json -w "%{http_code}" \
+              -H "Authorization: Bearer $tok" "$API/projects" 2>/tmp/err || echo "000")
+
+            if [ "$list_code" != "200" ]; then
+              echo "FAIL list ($acct) -> HTTP $list_code"
+              echo "- **$acct list projects**: HTTP $list_code ($(head -c 160 /tmp/err 2>/dev/null | tr -d '\n'))" >> /tmp/failures.md
+              continue
+            fi
+            if ! jq -e 'type == "array"' /tmp/projects.json >/dev/null 2>&1; then
+              echo "FAIL list ($acct) -> response is not a JSON array"
+              echo "- **$acct list projects**: unexpected response shape" >> /tmp/failures.md
+              continue
+            fi
+
+            n=$(jq 'length' /tmp/projects.json)
+            echo "$acct: $n project(s)"
+
+            for i in $(seq 0 $((n - 1))); do
+              [ "$n" -eq 0 ] && break
+              ref=$(jq -r ".[$i].id" /tmp/projects.json)
+              name=$(jq -r ".[$i].name" /tmp/projects.json)
+              status=$(jq -r ".[$i].status" /tmp/projects.json)
+              total=$((total + 1))
+
+              if [ "$status" = "ACTIVE_HEALTHY" ]; then
+                # real DB activity: runs SQL on the project's database
+                code=$(curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
+                  --retry 5 --retry-delay 10 --retry-all-errors \
+                  -o /tmp/q.json -w "%{http_code}" \
+                  -X POST -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
+                  --data '{"query":"select 1 as keepalive;"}' \
+                  "$API/projects/$ref/database/query" 2>/tmp/err || echo "000")
+                if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+                  echo "OK   $name ($ref) -> HTTP $code"
+                  ok=$((ok + 1))
+                else
+                  echo "FAIL $name ($ref) -> HTTP $code"
+                  echo "- **$name** (\`$ref\`): keep-alive query HTTP $code ($(head -c 160 /tmp/err 2>/dev/null | tr -d '\n'))" >> /tmp/failures.md
+                fi
+              else
+                # not healthy (INACTIVE / PAUSED / etc.) -> auto-restore
+                code=$(curl --silent --show-error --location --connect-timeout 15 --max-time 60 \
+                  --retry 3 --retry-delay 10 --retry-all-errors \
+                  -o /tmp/r.json -w "%{http_code}" \
+                  -X POST -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
+                  "$API/projects/$ref/restore" 2>/tmp/err || echo "000")
+                if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+                  echo "RESTORED $name ($ref) -> was $status, restore requested (HTTP $code)"
+                  restored=$((restored + 1))
+                  echo "- **$name** (\`$ref\`): was **$status**, auto-restore requested (HTTP $code). It will keep-alive normally once it finishes coming up." >> /tmp/failures.md
+                else
+                  echo "FAIL restore $name ($ref) -> was $status, HTTP $code"
+                  hint=""
+                  if [ "$code" = "403" ]; then
+                    hint=" — likely the free-tier cap of 2 active projects per organization is reached. Pause or upgrade another project in this org, or move this project to another org, then it can be restored."
+                  fi
+                  echo "- **$name** (\`$ref\`): was **$status** and restore FAILED (HTTP $code)$hint" >> /tmp/failures.md
+                fi
+              fi
+
+              sleep 2 # respect Management API rate limit (~60 req/min)
+            done
+
+            sleep 2
+          done
+
+          echo "Summary: $total project(s) seen, $ok kept alive, $restored restore(s) requested."
+
+          if [ -s /tmp/failures.md ]; then
+            echo "had_alerts=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "had_alerts=false" >> "$GITHUB_OUTPUT"
+            echo "All projects healthy and kept alive."
+          fi
+
+      - name: Open or update a tracking issue if anything needs attention
+        if: steps.run.outputs.had_alerts == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const alerts = fs.readFileSync('/tmp/failures.md', 'utf8').trim();
+            const title = "Supabase keep-alive: attention needed";
+            const body = [
+              `The Supabase auto-discovery keep-alive flagged one or more projects (run ${context.runId}).`,
+              ``,
+              alerts,
+              ``,
+              `Restores are asynchronous and clear themselves on the next run. Any failed query or failed restore needs a look before the 7-day pause window closes.`,
+              `[Run logs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+            ].join("\n");
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner, repo: context.repo.repo, state: "open", per_page: 100,
+            });
+            const existing = open.find((i) => i.title === title && !i.pull_request);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo, title, body,
+              });
+            }
+
+      - name: Fail the run if any project could not be kept alive or restored
+        if: steps.run.outputs.had_alerts == 'true'
+        run: |
+          # A pure restore request is informational, not a failure. Fail only on real
+          # keep-alive-query failures or failed restores.
+          if grep -qiE "keep-alive query HTTP|restore FAILED|list projects" /tmp/failures.md; then
+            echo "::error::One or more Supabase projects failed to keep alive or restore (see the tracking issue and logs)"
+            exit 1
+          fi
+          echo "Only informational restore requests were recorded; not failing the run."
