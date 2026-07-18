@@ -35,9 +35,11 @@ jobs:
         id: run
         env:
           TOKENS_JSON: ${{ secrets.SUPABASE_ACCESS_TOKENS }}
+          SKIP_JSON: ${{ secrets.SUPABASE_KEEPALIVE_SKIP }}
         run: |
           set -uo pipefail
           API="https://api.supabase.com/v1"
+          FREE_ACTIVE_CAP=2 # Supabase Free plan: max 2 active projects per organization
 
           if [ -z "${TOKENS_JSON:-}" ]; then
             echo "::error::SUPABASE_ACCESS_TOKENS secret is empty or unset"
@@ -47,6 +49,16 @@ jobs:
             echo "::error::SUPABASE_ACCESS_TOKENS is not valid JSON with a non-empty .tokens array"
             exit 1
           fi
+
+          # Optional skip-list: project refs that must be left alone (never pinged,
+          # never restored). Used for projects deliberately kept paused, e.g. the
+          # odd one out in an org that already has its 2 free active slots filled.
+          SKIP_REFS=" "
+          if [ -n "${SKIP_JSON:-}" ] && printf '%s' "$SKIP_JSON" | jq -e '.refs | type == "array"' >/dev/null 2>&1; then
+            while IFS= read -r r; do [ -n "$r" ] && SKIP_REFS="$SKIP_REFS$r "; done \
+              < <(printf '%s' "$SKIP_JSON" | jq -r '.refs[]')
+          fi
+          is_skipped() { case "$SKIP_REFS" in *" $1 "*) return 0;; *) return 1;; esac; }
 
           : > /tmp/failures.md
           total=0
@@ -78,7 +90,11 @@ jobs:
             fi
 
             n=$(jq 'length' /tmp/projects.json)
-            echo "$acct: $n project(s)"
+            active_now=$(jq '[.[] | select(.status == "ACTIVE_HEALTHY")] | length' /tmp/projects.json)
+            # remaining free active slots in this org (never restore past the cap)
+            slots=$((FREE_ACTIVE_CAP - active_now))
+            [ "$slots" -lt 0 ] && slots=0
+            echo "$acct: $n project(s), $active_now active, $slots free slot(s)"
 
             for i in $(seq 0 $((n - 1))); do
               [ "$n" -eq 0 ] && break
@@ -86,6 +102,11 @@ jobs:
               name=$(jq -r ".[$i].name" /tmp/projects.json)
               status=$(jq -r ".[$i].status" /tmp/projects.json)
               total=$((total + 1))
+
+              if is_skipped "$ref"; then
+                echo "SKIP $name ($ref) -> on skip-list, left as $status"
+                continue
+              fi
 
               if [ "$status" = "ACTIVE_HEALTHY" ]; then
                 # real DB activity: runs SQL on the project's database
@@ -103,7 +124,15 @@ jobs:
                   echo "- **$name** (\`$ref\`): keep-alive query HTTP $code ($(head -c 160 /tmp/err 2>/dev/null | tr -d '\n'))" >> /tmp/failures.md
                 fi
               else
-                # not healthy (INACTIVE / PAUSED / etc.) -> auto-restore
+                # not healthy (INACTIVE / PAUSED / etc.). Only restore if the org has a
+                # free active slot; otherwise the cap makes restore a guaranteed 403 and
+                # we would thrash every run. No free slot -> report, don't fight the cap.
+                if [ "$slots" -le 0 ]; then
+                  echo "CAPPED $name ($ref) -> was $status; org already at $FREE_ACTIVE_CAP active, not restoring"
+                  echo "- **$name** (\`$ref\`): paused and left paused. Its org already has $FREE_ACTIVE_CAP active projects (Free plan cap). To bring it back, pause/upgrade another project in the same org, or add its ref to the skip-list to silence this note." >> /tmp/failures.md
+                  sleep 2
+                  continue
+                fi
                 code=$(curl --silent --show-error --location --connect-timeout 15 --max-time 60 \
                   --retry 3 --retry-delay 10 --retry-all-errors \
                   -o /tmp/r.json -w "%{http_code}" \
@@ -112,14 +141,11 @@ jobs:
                 if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
                   echo "RESTORED $name ($ref) -> was $status, restore requested (HTTP $code)"
                   restored=$((restored + 1))
+                  slots=$((slots - 1)) # consumed a free slot
                   echo "- **$name** (\`$ref\`): was **$status**, auto-restore requested (HTTP $code). It will keep-alive normally once it finishes coming up." >> /tmp/failures.md
                 else
                   echo "FAIL restore $name ($ref) -> was $status, HTTP $code"
-                  hint=""
-                  if [ "$code" = "403" ]; then
-                    hint=" — likely the free-tier cap of 2 active projects per organization is reached. Pause or upgrade another project in this org, or move this project to another org, then it can be restored."
-                  fi
-                  echo "- **$name** (\`$ref\`): was **$status** and restore FAILED (HTTP $code)$hint" >> /tmp/failures.md
+                  echo "- **$name** (\`$ref\`): was **$status** and restore FAILED (HTTP $code: $(head -c 120 /tmp/err 2>/dev/null | tr -d '\n'))" >> /tmp/failures.md
                 fi
               fi
 
