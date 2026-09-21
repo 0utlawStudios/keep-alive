@@ -1,0 +1,26 @@
+name: supabase-keepalive
+
+on:
+  schedule:
+    - cron: "17 11 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supabase-keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Discover accounts and verify database activity
+        env:
+          SUPABASE_KEEPALIVE_ACCOUNTS: ${{ secrets.SUPABASE_KEEPALIVE_ACCOUNTS }}
+        run: python3 scripts/supabase_keepalive.py
