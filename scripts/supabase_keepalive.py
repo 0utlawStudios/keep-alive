@@ -77,6 +77,15 @@ def config_from_json(raw):
                 raise ValueError()
             if not isinstance(account.get("token"), str) or not re.fullmatch(r"sbp_[A-Za-z0-9_]+", account["token"]):
                 raise ValueError()
+            scope = account.get("token_scope", "user")
+            if scope not in ("user", "organization"):
+                raise ValueError()
+            if scope == "organization":
+                org_ids = account.get("organization_ids")
+                if (not isinstance(org_ids, list) or not org_ids
+                        or any(not isinstance(x, str) or not REF.fullmatch(x) for x in org_ids)
+                        or len(set(org_ids)) != len(org_ids)):
+                    raise ValueError()
             emails.add(account["email"])
         return cfg
     except (ValueError, KeyError, TypeError):
@@ -115,10 +124,23 @@ def run(cfg, api=request, sleep=time.sleep, emit=print):
         token = account["token"]
         email = account["email"]
         try:
-            profile = api(token, "/profile")
-            if not isinstance(profile, dict) or profile.get("primary_email") != email:
-                record("identity_failed")
-                continue
+            scoped = account.get("token_scope", "user") == "organization"
+            if scoped:
+                # Scoped tokens cannot call /profile. Their email-to-org binding
+                # must be verified in the authenticated dashboard at enrollment.
+                # Revalidate the exact organization scope before any project work.
+                expected_orgs = set(account["organization_ids"])
+                orgs = api(token, "/organizations")
+                if (not isinstance(orgs, list)
+                        or any(not isinstance(o, dict) or not isinstance(o.get("id"), str) for o in orgs)
+                        or {o["id"] for o in orgs} != expected_orgs):
+                    record("scope_failed")
+                    continue
+            else:
+                profile = api(token, "/profile")
+                if not isinstance(profile, dict) or profile.get("primary_email") != email:
+                    record("identity_failed")
+                    continue
             projects = api(token, "/projects")
             if not isinstance(projects, list):
                 record("discovery_failed")
@@ -127,6 +149,9 @@ def run(cfg, api=request, sleep=time.sleep, emit=print):
                    or not REF.fullmatch(p["id"]) or not isinstance(p.get("status"), str)
                    for p in projects):
                 record("discovery_failed")
+                continue
+            if scoped and any(p.get("organization_id") not in expected_orgs for p in projects):
+                record("scope_failed")
                 continue
             verified_accounts.add(email)
         except (ApiError, ValueError, TypeError):

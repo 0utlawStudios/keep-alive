@@ -50,6 +50,48 @@ class KeepAliveTests(unittest.TestCase):
         self.assertEqual(summary["accounts_verified"], 1)
         self.assertEqual(summary["failures"], 1)
 
+    def test_scoped_token_checks_pinned_org_before_query_without_profile(self):
+        cfg = config()
+        cfg['accounts'][0].update(token_scope='organization', organization_ids=[OTHER])
+        calls = []
+        def api(token, path, payload=None, **kwargs):
+            calls.append(path)
+            self.assertNotEqual(path, '/profile')
+            if path == '/organizations':
+                return [{'id': OTHER}]
+            if path == '/projects':
+                return [{'id': REF, 'organization_id': OTHER, 'status': 'ACTIVE_HEALTHY'}]
+            return self.api(token, path, payload, **kwargs)
+        summary, _ = self.execute(cfg, api)
+        self.assertEqual(summary['projects_healthy'], 1)
+        self.assertEqual(summary['failures'], 0)
+        self.assertEqual(calls[:2], ['/organizations', '/projects'])
+
+    def test_scoped_token_rejects_wrong_org_or_cross_org_project(self):
+        for bad_org in [True, False]:
+            cfg = config()
+            cfg['accounts'][0].update(token_scope='organization', organization_ids=[OTHER])
+            def api(token, path, payload=None, **kwargs):
+                if path == '/organizations':
+                    return [{'id': REF if bad_org else OTHER}]
+                if path == '/projects':
+                    return [{'id': REF, 'organization_id': REF, 'status': 'INACTIVE'}]
+                self.fail('Scoped mismatch must prevent every project operation')
+            summary, _ = self.execute(cfg, api)
+            self.assertEqual(summary['accounts_verified'], 0)
+            self.assertGreater(summary['failures'], 0)
+
+    def test_scoped_config_requires_explicit_nonempty_valid_org_binding(self):
+        for org_ids in [None, [], ['../../bad'], [OTHER, OTHER]]:
+            cfg = config()
+            cfg['accounts'][0].update(token_scope='organization', organization_ids=org_ids)
+            with self.assertRaises(ValueError):
+                m.config_from_json(json.dumps(cfg))
+        cfg = config()
+        cfg['accounts'][0]['token_scope'] = 'unexpected'
+        with self.assertRaises(ValueError):
+            m.config_from_json(json.dumps(cfg))
+
     def test_exact_exclusion_never_queries_or_restores(self):
         cfg = config()
         cfg["excluded_refs"] = [REF]

@@ -51,13 +51,21 @@ are preserved. The old unmerged discovery proposal is not needed by this version
 }
 ```
 
-- Store one usable personal access token per named login. Each account's profile
-  must match the configured email before any project operation.
-- Prefer scoped tokens where available: profile access, account-wide project
-  discovery, Database Read, and Project Settings Read/Write for restoration.
-  Verify the token against this runner before replacing an existing token.
-  Scoped tokens are being rolled out by Supabase and are not available to every
-  account. Classic tokens have broad account privileges and must remain secret.
+- Store one usable personal access token per named login. User-scoped tokens must
+  return a profile matching the configured email before any project operation.
+- For an organization-scoped token, first verify the account email and its
+  organizations in the authenticated dashboard. Add `"token_scope":"organization"`
+  and `"organization_ids":["<verified organization ID>"]` to that account entry.
+  These tokens cannot call `/profile`; the runner instead checks the exact
+  configured organization set and rejects projects outside it. This verifies the
+  resource scope at runtime, not the token owner's email. New organizations need
+  explicit enrollment and an updated token; new projects in enrolled organizations
+  are discovered automatically.
+- Scoped permissions: Organizations Read, Projects (account-wide) Read,
+  Organization Settings Read, Database Read, and Project Settings Read/Write
+  for restoration. All other capabilities can remain None. Record the expiration
+  privately and renew before it expires. Verify against this runner before replacing
+  an existing token. Classic tokens have broad account privileges and must remain secret.
 - Missing or inaccessible expected accounts fail coverage explicitly. An empty
   project list is accepted only after identity and discovery succeed.
 - A project reference in `excluded_refs` is never queried or resumed.
