@@ -17,10 +17,35 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
       - name: Discover accounts and verify database activity
         env:
           SUPABASE_KEEPALIVE_ACCOUNTS: ${{ secrets.SUPABASE_KEEPALIVE_ACCOUNTS }}
         run: python3 scripts/supabase_keepalive.py
+
+  heartbeat:
+    # Repository maintenance remains independent of failed database/API checks.
+    needs: keepalive
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Keep scheduled workflows active
+        shell: bash
+        run: |
+          set -euo pipefail
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if [ $(( (now - last) / 86400 )) -ge 25 ]; then
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > last-heartbeat.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add last-heartbeat.txt
+            git commit -m "chore: keep-alive heartbeat [skip actions]"
+            git push
+          fi

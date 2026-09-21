@@ -15,6 +15,7 @@ import urllib.request
 
 API = "https://api.supabase.com/v1"
 REF = re.compile(r"^[a-z]{20}$")
+QUERIES_PER_PROJECT = 3
 
 
 class ApiError(Exception):
@@ -77,6 +78,11 @@ def config_from_json(raw):
                 raise ValueError()
             if not isinstance(account.get("token"), str) or not re.fullmatch(r"sbp_[A-Za-z0-9_]+", account["token"]):
                 raise ValueError()
+            refs = account.get("expected_project_refs")
+            if (not isinstance(refs, list) or not refs
+                    or any(not isinstance(ref, str) or not REF.fullmatch(ref) for ref in refs)
+                    or len(set(refs)) != len(refs)):
+                raise ValueError()
             scope = account.get("token_scope", "user")
             if scope not in ("user", "organization"):
                 raise ValueError()
@@ -111,11 +117,14 @@ def run(cfg, api=request, sleep=time.sleep, emit=print):
         emit(kind.upper() + suffix)
 
     def query(token, ref):
-        response = api(token, f"/projects/{ref}/database/query/read-only",
-                       {"query": "select 1 as keepalive;"})
-        if response != [{"keepalive": 1}]:
-            record("query_invalid", ref)
-            return
+        # Supabase recommends a few user database requests each day. These
+        # constant queries create activity without touching application tables.
+        for _ in range(QUERIES_PER_PROJECT):
+            response = api(token, f"/projects/{ref}/database/query/read-only",
+                           {"query": "select 1 as keepalive;"})
+            if response != [{"keepalive": 1}]:
+                record("query_invalid", ref)
+                return
         seen.add(ref)
         pending.pop(ref, None)
         record("healthy", ref)
@@ -154,6 +163,9 @@ def run(cfg, api=request, sleep=time.sleep, emit=print):
                 record("scope_failed")
                 continue
             verified_accounts.add(email)
+            discovered_refs = {project["id"] for project in projects}
+            for ref in sorted(set(account["expected_project_refs"]) - discovered_refs):
+                record("project_missing", ref)
         except (ApiError, ValueError, TypeError):
             record("account_failed")
             continue
@@ -220,7 +232,7 @@ def run(cfg, api=request, sleep=time.sleep, emit=print):
     # A later valid credential may recover a project visible to multiple accounts.
     recovered = {r["ref"] for r in results if r["kind"] == "healthy"}
     failures = [r for r in results if r["kind"] not in ("healthy", "excluded", "restore_requested")
-                and not (r["ref"] and r["ref"] in recovered)]
+                and not (r["kind"] != "project_missing" and r["ref"] and r["ref"] in recovered)]
     summary = {"accounts_verified": len(verified_accounts), "accounts_expected": len(cfg["expected_accounts"]),
                "projects_healthy": len(recovered),
                "projects_excluded": len({r["ref"] for r in results if r["kind"] == "excluded"}),

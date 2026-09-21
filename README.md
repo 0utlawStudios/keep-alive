@@ -45,7 +45,7 @@ are preserved. The old unmerged discovery proposal is not needed by this version
 
 ```json
 {
-  "accounts": [{"email": "owner@example.com", "token": "sbp_example"}],
+  "accounts": [{"email": "owner@example.com", "token": "sbp_example", "expected_project_refs": ["abcdefghijklmnopqrst"]}],
   "expected_accounts": ["owner@example.com"],
   "excluded_refs": []
 }
@@ -66,10 +66,12 @@ are preserved. The old unmerged discovery proposal is not needed by this version
   for restoration. All other capabilities can remain None. Record the expiration
   privately and renew before it expires. Verify against this runner before replacing
   an existing token. Classic tokens have broad account privileges and must remain secret.
-- Missing or inaccessible expected accounts fail coverage explicitly. An empty
-  project list is accepted only after identity and discovery succeed.
+- Missing or inaccessible expected accounts fail coverage explicitly. Each account
+  pins its known projects in `expected_project_refs`; disappearing projects fail
+  coverage rather than silently passing. Newly discovered projects still receive
+  queries. Update the baseline deliberately after verified additions or deletions.
 - A project reference in `excluded_refs` is never queried or resumed.
-- Healthy projects receive `select 1 as keepalive;` through the server-enforced
+- Healthy projects receive three `select 1 as keepalive;` requests per daily run through the server-enforced
   read-only query endpoint. No application tables are read or changed.
 - Only `INACTIVE` projects receive a restore request, once per run. Transitional
   projects share a three-minute polling budget after healthy projects are served, and recovery requires a successful
@@ -80,11 +82,19 @@ are preserved. The old unmerged discovery proposal is not needed by this version
   project names/references, tokens, URLs, or API error bodies. Hashes are the first
   twelve hexadecimal characters of SHA-256(project reference), computed locally
   when an operator needs to map an alert.
-- The workflow has read-only repository permissions and no pull-request trigger.
+- The database job has read-only repository permissions and no pull-request trigger.
   It does not publish issues or upload artifacts containing inventory data.
 
-The existing monthly heartbeat keeps repository activity current for both
-schedules. No third-party dependencies are installed by the Supabase job.
+An isolated heartbeat job runs even when database checks fail and writes only a
+dated heartbeat commit after 25 days without repository activity. This does not
+depend on the older endpoint watchdog. Only this maintenance job receives
+repository write permission. Third-party actions are pinned to full commit SHAs.
+No third-party dependencies are installed by the Supabase job.
+
+The endpoint watchdog accepts only HTTPS 2xx responses and never follows
+redirects with credential-bearing headers. Its public logs and failure issues
+contain ordinal target labels and HTTP status codes, not configured names, URLs,
+headers, response bodies or curl error text.
 
 ### Local verification
 

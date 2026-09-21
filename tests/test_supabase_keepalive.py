@@ -15,11 +15,49 @@ EMAIL = "test@example.invalid"
 
 
 def config():
-    return {"accounts": [{"email": EMAIL, "token": "sbp_fixture"}],
+    return {"accounts": [{"email": EMAIL, "token": "sbp_fixture", "expected_project_refs": [REF]}],
             "expected_accounts": [EMAIL], "excluded_refs": []}
 
 
 class KeepAliveTests(unittest.TestCase):
+    def test_shared_project_recovery_does_not_erase_account_coverage_failure(self):
+        cfg = config()
+        cfg["accounts"].append({"email": "second@example.invalid", "token": "sbp_second",
+                                "expected_project_refs": [REF]})
+        cfg["expected_accounts"].append("second@example.invalid")
+        def api(token, path, payload=None, **kwargs):
+            if path == "/profile":
+                return {"primary_email": EMAIL if token == "sbp_fixture" else "second@example.invalid"}
+            if path == "/projects" and token == "sbp_fixture":
+                return []
+            return self.api(token, path, payload, **kwargs)
+        summary, rows = self.execute(cfg, api)
+        self.assertEqual(summary["accounts_verified"], 2)
+        self.assertEqual(summary["projects_healthy"], 1)
+        self.assertEqual(summary["failures"], 1)
+        self.assertIn({"kind": "project_missing", "ref": REF}, rows)
+
+    def test_missing_known_project_fails_but_new_projects_still_receive_queries(self):
+        def api(token, path, payload=None, **kwargs):
+            if path == "/projects":
+                return [{"id": OTHER, "status": "ACTIVE_HEALTHY"}]
+            return self.api(token, path, payload, **kwargs)
+        summary, rows = self.execute(config(), api)
+        self.assertEqual(summary["projects_healthy"], 1)
+        self.assertGreater(summary["failures"], 0)
+        self.assertIn({"kind": "project_missing", "ref": REF}, rows)
+
+    def test_expected_project_refs_are_mandatory_and_valid(self):
+        for refs in [None, [], ["../../bad"], [REF, REF], "not-a-list"]:
+            cfg = config()
+            cfg["accounts"][0]["expected_project_refs"] = refs
+            with self.subTest(refs=refs), self.assertRaises(ValueError):
+                m.config_from_json(json.dumps(cfg))
+        cfg = config()
+        del cfg["accounts"][0]["expected_project_refs"]
+        with self.assertRaises(ValueError):
+            m.config_from_json(json.dumps(cfg))
+
     def execute(self, cfg, api):
         self.logs = []
         return m.run(cfg, api=api, sleep=lambda _: None, emit=self.logs.append)
@@ -169,7 +207,7 @@ class KeepAliveTests(unittest.TestCase):
         self.assertEqual(summary["projects_healthy"], 1)
         self.assertEqual(summary["failures"], 1)
 
-    def test_duplicate_projects_query_once(self):
+    def test_duplicate_projects_receive_one_batch_of_three_queries(self):
         query_count = 0
         def api(token, path, payload=None, **kwargs):
             nonlocal query_count
@@ -179,8 +217,22 @@ class KeepAliveTests(unittest.TestCase):
                 query_count += 1
             return self.api(token, path, payload, **kwargs)
         summary, _ = self.execute(config(), api)
-        self.assertEqual(query_count, 1)
+        self.assertEqual(query_count, 3)
         self.assertEqual(summary["projects_healthy"], 1)
+
+    def test_all_three_daily_queries_must_succeed(self):
+        calls = 0
+        def api(token, path, payload=None, **kwargs):
+            nonlocal calls
+            if path.endswith('/query/read-only'):
+                calls += 1
+                if calls == 3:
+                    raise m.ApiError(503)
+            return self.api(token, path, payload, **kwargs)
+        summary, _ = self.execute(config(), api)
+        self.assertEqual(calls, 3)
+        self.assertEqual(summary['projects_healthy'], 0)
+        self.assertEqual(summary['failures'], 1)
 
     def test_invalid_configs_fail_without_echoing_input(self):
         for raw in ["", "bad sbp_secret", "{}", '{"accounts": []}', json.dumps({**config(), "excluded_refs": ["../../leak"]})]:
@@ -196,7 +248,7 @@ class KeepAliveTests(unittest.TestCase):
 
     def test_ambiguous_restore_is_not_retried_through_another_account(self):
         cfg = config()
-        cfg['accounts'].append({'email': 'second@example.invalid', 'token': 'sbp_second'})
+        cfg['accounts'].append({'email': 'second@example.invalid', 'token': 'sbp_second', 'expected_project_refs': [REF]})
         cfg['expected_accounts'].append('second@example.invalid')
         restores = []
         def api(token, path, payload=None, **kwargs):

@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Ping all keep-alive targets
         id: ping
@@ -57,12 +57,27 @@ jobs:
             echo "::error::merged keep-alive target list is empty"
             exit 1
           fi
+          # Validate before extracting: jq errors can otherwise echo secret values.
+          if ! printf '%s' "$merged_targets" | jq -e '
+            all(.targets[];
+              type == "object" and
+              (.url | type == "string" and startswith("https://") and (test("[\r\n]") | not)) and
+              (.method == null or (.method | type == "string" and test("^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS)$"))) and
+              (.body == null or (.body | type == "string")) and
+              (.headers == null or (.headers | type == "object" and
+                all(to_entries[]; (.key | test("^[A-Za-z0-9-]+$")) and
+                  (.value | type == "string" and (test("[\r\n]") | not)))))
+            )' >/dev/null 2>&1; then
+            echo "::error::Invalid keep-alive target configuration"
+            exit 1
+          fi
           n=$(printf '%s' "$merged_targets" | jq '.targets | length')
           echo "Pinging $n target(s)"
-          : > /tmp/failures.md
+          failures_file="$RUNNER_TEMP/keepalive-failures.md"
+          : > "$failures_file"
           for i in $(seq 0 $((n - 1))); do
             t=$(printf '%s' "$merged_targets" | jq -c ".targets[$i]")
-            name=$(printf '%s' "$t" | jq -r '.name')
+            name="target-$((i + 1))"
             url=$(printf '%s' "$t" | jq -r '.url')
             method=$(printf '%s' "$t" | jq -r '.method // "GET"')
             body=$(printf '%s' "$t" | jq -r '.body // ""')
@@ -70,19 +85,21 @@ jobs:
             while IFS= read -r h; do
               [ -n "$h" ] && hdr_args+=( -H "$h" )
             done < <(printf '%s' "$t" | jq -r '.headers // {} | to_entries[] | "\(.key): \(.value)"')
-            args=( --silent --show-error --location --connect-timeout 15 --max-time 45
+            # Never forward secret headers to a redirected host or use plaintext HTTP.
+            args=( --silent --show-error --proto '=https' --connect-timeout 15 --max-time 45
                    --retry 5 --retry-delay 10 --retry-all-errors
-                   -o /tmp/resp -w "%{http_code}" -X "$method" )
+                   -o /dev/null -w "%{http_code}" -X "$method" )
             [ -n "$body" ] && args+=( --data "$body" )
-            code=$(curl "${args[@]}" "${hdr_args[@]}" "$url" 2>/tmp/err || echo "000")
-            if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then
+            code=$(curl "${args[@]}" "${hdr_args[@]}" "$url" 2>/dev/null) || code=000
+            [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
+            if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
               echo "OK   $name -> HTTP $code"
             else
               echo "FAIL $name -> HTTP $code"
-              echo "- **$name**: HTTP $code ($(head -c 160 /tmp/err 2>/dev/null | tr -d '\n'))" >> /tmp/failures.md
+              echo "- **$name**: HTTP $code" >> "$failures_file"
             fi
           done
-          if [ -s /tmp/failures.md ]; then
+          if [ -s "$failures_file" ]; then
             echo "had_failures=true" >> "$GITHUB_OUTPUT"
           else
             echo "had_failures=false" >> "$GITHUB_OUTPUT"
@@ -92,7 +109,7 @@ jobs:
       - name: Monthly heartbeat commit (dodge 60-day auto-disable)
         if: always()
         run: |
-          set -uo pipefail
+          set -euo pipefail
           last=$(git log -1 --format=%ct 2>/dev/null || echo 0)
           now=$(date +%s)
           age_days=$(( (now - last) / 86400 ))
@@ -109,12 +126,13 @@ jobs:
           fi
 
       - name: Open or update a tracking issue if any target failed
-        if: steps.ping.outputs.had_failures == 'true'
-        uses: actions/github-script@v7
+        if: ${{ !cancelled() && steps.ping.outputs.had_failures == 'true' }}
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const fs = require('fs');
-            const failures = fs.readFileSync('/tmp/failures.md', 'utf8').trim();
+            const path = require('path');
+            const failures = fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'keepalive-failures.md'), 'utf8').trim();
             const title = "Keep-alive ping failed";
             const body = [
               `One or more keep-alive targets failed (run ${context.runId}).`,
@@ -139,7 +157,7 @@ jobs:
             }
 
       - name: Fail the run if any target failed
-        if: steps.ping.outputs.had_failures == 'true'
+        if: ${{ !cancelled() && steps.ping.outputs.had_failures == 'true' }}
         run: |
           echo "::error::One or more keep-alive targets failed (see the tracking issue and logs above)"
           exit 1
