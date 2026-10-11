@@ -15,11 +15,14 @@ GitHub Actions minutes, so this watchdog never consumes the account's private
   is the base list, and optional `KEEPALIVE_EXTRA_TARGETS` entries are appended at
   runtime. This repository contains no URLs, keys, or tokens.
 - **Hardened**: each target is retried with backoff; a failed ping fails the run,
-  opens or updates a tracking issue, and is visible in the Actions log.
-- **Self-sustaining**: a monthly heartbeat commit keeps the schedule from being
-  auto-disabled after 60 days of repository dormancy.
-- **Least privilege**: the workflow can only write repository contents (heartbeat)
-  and issues (alerts).
+  opens or updates a tracking issue, and is visible in the Actions log. The issue
+  closes itself on the next fully healthy run.
+- **Self-sustaining**: the daily Supabase workflow commits a heartbeat after 25 days
+  without repository activity, so GitHub never auto-disables either schedule under
+  its 60-day dormancy rule. It is the only job that commits.
+- **Least privilege**: workflows default to no permissions. The jobs that read
+  secrets get none (endpoint) or read-only contents (Supabase). Separate jobs that
+  never see a secret get `issues: write` (alerts) or `contents: write` (heartbeat).
 
 ## Triggers
 
@@ -45,14 +48,24 @@ are preserved. The old unmerged discovery proposal is not needed by this version
 
 ```json
 {
-  "accounts": [{"email": "owner@example.com", "token": "sbp_example", "expected_project_refs": ["abcdefghijklmnopqrst"]}],
+  "accounts": [{
+    "email": "owner@example.com",
+    "tokens": ["sbp_primary", {"token": "sbp_fallback", "expires_at": "2026-12-20"}],
+    "expected_project_refs": ["abcdefghijklmnopqrst"]
+  }],
   "expected_accounts": ["owner@example.com"],
   "excluded_refs": []
 }
 ```
 
-- Store one usable personal access token per named login. User-scoped tokens must
-  return a profile matching the configured email before any project operation.
+- Each account holds an ordered `tokens` list (the legacy single `"token"` field is
+  still accepted, never both). Every token is verified on every run: user-scoped
+  tokens must return a profile matching the configured email, and organization
+  tokens must return the exact pinned organization set. The first verified token
+  does the account's work, so a dead primary falls back without losing coverage.
+- A token that fails logs `TOKEN_DEAD` (HTTP 401/403) or `TOKEN_FAILED`, and an
+  optional `expires_at` (UTC date) within 14 days logs `TOKEN_EXPIRING`. Each still
+  lets every project receive its queries, then fails the run so the alert fires.
 - For an organization-scoped token, first verify the account email and its
   organizations in the authenticated dashboard. Add `"token_scope":"organization"`
   and `"organization_ids":["<verified organization ID>"]` to that account entry.
@@ -78,18 +91,21 @@ are preserved. The old unmerged discovery proposal is not needed by this version
   query. An accepted restore request alone does not count as healthy.
 - Supabase enforces capacity and permission rules. The runner never upgrades,
   transfers, deletes, pauses another project, or retries a restore mutation.
-- Logs contain opaque project hashes and aggregate counts, not account emails,
-  project names/references, tokens, URLs, or API error bodies. Hashes are the first
+- Logs contain opaque project hashes, account and token ordinals in configuration
+  order (`account-03 slot-2`), HTTP status codes and aggregate counts, not account
+  emails, project names/references, tokens, URLs, or API error bodies. Hashes are the first
   twelve hexadecimal characters of SHA-256(project reference), computed locally
   when an operator needs to map an alert.
 - The database job has read-only repository permissions and no pull-request trigger.
   It does not publish issues or upload artifacts containing inventory data.
+- A separate alert job opens or comments on the issue "Supabase keep-alive failed"
+  with the run link only, and closes it after the next passing run.
 
 An isolated heartbeat job runs even when database checks fail and writes only a
-dated heartbeat commit after 25 days without repository activity. This does not
-depend on the older endpoint watchdog. Only this maintenance job receives
-repository write permission. Third-party actions are pinned to full commit SHAs.
-No third-party dependencies are installed by the Supabase job.
+dated heartbeat commit after 25 days without repository activity. Only this
+maintenance job receives repository write permission. Actions are pinned to full
+commit SHAs and jobs run on `ubuntu-24.04`. No third-party dependencies are
+installed by the Supabase job.
 
 The endpoint watchdog accepts only HTTPS 2xx responses and never follows
 redirects with credential-bearing headers. Its public logs and failure issues

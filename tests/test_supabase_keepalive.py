@@ -4,6 +4,7 @@ import pathlib
 import unittest
 from unittest import mock
 import http.client
+import datetime
 
 spec = importlib.util.spec_from_file_location("keepalive", pathlib.Path(__file__).parents[1] / "scripts/supabase_keepalive.py")
 m = importlib.util.module_from_spec(spec)
@@ -35,7 +36,7 @@ class KeepAliveTests(unittest.TestCase):
         self.assertEqual(summary["accounts_verified"], 2)
         self.assertEqual(summary["projects_healthy"], 1)
         self.assertEqual(summary["failures"], 1)
-        self.assertIn({"kind": "project_missing", "ref": REF}, rows)
+        self.assertIn({"kind": "project_missing", "ref": REF, "account": 1}, rows)
 
     def test_missing_known_project_fails_but_new_projects_still_receive_queries(self):
         def api(token, path, payload=None, **kwargs):
@@ -45,7 +46,7 @@ class KeepAliveTests(unittest.TestCase):
         summary, rows = self.execute(config(), api)
         self.assertEqual(summary["projects_healthy"], 1)
         self.assertGreater(summary["failures"], 0)
-        self.assertIn({"kind": "project_missing", "ref": REF}, rows)
+        self.assertIn({"kind": "project_missing", "ref": REF, "account": 1}, rows)
 
     def test_expected_project_refs_are_mandatory_and_valid(self):
         for refs in [None, [], ["../../bad"], [REF, REF], "not-a-list"]:
@@ -294,6 +295,97 @@ class KeepAliveTests(unittest.TestCase):
         self.assertLess(calls.index(f'/projects/{REF}/database/query/read-only'), calls.index(f'/projects/{refs[0]}'))
         self.assertEqual(summary['projects_healthy'], 1)
         self.assertEqual(summary['failures'], len(refs))
+
+    def fallback_config(self, *tokens):
+        cfg = config()
+        del cfg["accounts"][0]["token"]
+        cfg["accounts"][0]["tokens"] = list(tokens)
+        return cfg
+
+    def test_legacy_token_and_tokens_list_are_both_accepted(self):
+        self.assertEqual(m.config_from_json(json.dumps(config())), config())
+        cfg = self.fallback_config("sbp_one", {"token": "sbp_two", "expires_at": "2026-12-20"})
+        self.assertEqual(m.config_from_json(json.dumps(cfg)), cfg)
+
+    def test_token_fields_are_validated(self):
+        bad = [[], ["sbp_one", "sbp_one"], ["not-a-token"], [{"token": "sbp_one", "expires_at": "20261220"}],
+               [{"token": "sbp_one", "expires_at": "2026-13-40"}], [{"token": "sbp_one", "extra": 1}], "sbp_one"]
+        for tokens in bad:
+            with self.subTest(tokens=tokens), self.assertRaises(ValueError):
+                m.config_from_json(json.dumps(self.fallback_config(*tokens) if isinstance(tokens, list)
+                                              else {**config(), "accounts": [{**config()["accounts"][0], "tokens": tokens}]}))
+        both = config()
+        both["accounts"][0]["tokens"] = ["sbp_two"]
+        with self.assertRaises(ValueError):
+            m.config_from_json(json.dumps(both))
+
+    def test_dead_primary_token_falls_back_pings_projects_and_fails_run(self):
+        used = []
+        def api(token, path, payload=None, **kwargs):
+            if token == "sbp_dead":
+                raise m.ApiError(401)
+            if path.endswith("/query/read-only"):
+                used.append(token)
+            return self.api(token, path, payload, **kwargs)
+        summary, rows = self.execute(self.fallback_config("sbp_dead", "sbp_live"), api)
+        self.assertEqual(summary["accounts_verified"], 1)
+        self.assertEqual(summary["projects_healthy"], 1)
+        self.assertEqual((summary["tokens_verified"], summary["tokens_expected"]), (1, 2))
+        self.assertEqual(summary["failures"], 1)
+        self.assertEqual(set(used), {"sbp_live"})
+        self.assertIn("TOKEN_DEAD account-01 slot-1 http=401", self.logs)
+
+    def test_every_fallback_is_checked_even_when_primary_works(self):
+        def api(token, path, payload=None, **kwargs):
+            if token == "sbp_dead":
+                raise m.ApiError(401)
+            return self.api(token, path, payload, **kwargs)
+        summary, _ = self.execute(self.fallback_config("sbp_live", "sbp_dead"), api)
+        self.assertEqual(summary["projects_healthy"], 1)
+        self.assertEqual(summary["failures"], 1)
+        self.assertIn("TOKEN_DEAD account-01 slot-2 http=401", self.logs)
+
+    def test_fallback_with_another_identity_is_never_used(self):
+        def api(token, path, payload=None, **kwargs):
+            if path == "/profile":
+                return {"primary_email": EMAIL if token == "sbp_live" else "other@example.invalid"}
+            return self.api(token, path, payload, **kwargs)
+        summary, _ = self.execute(self.fallback_config("sbp_other", "sbp_live"), api)
+        self.assertEqual(summary["projects_healthy"], 1)
+        self.assertEqual(summary["failures"], 1)
+        self.assertIn("IDENTITY_FAILED account-01 slot-1", self.logs)
+        summary, _ = self.execute(self.fallback_config("sbp_other"), api)
+        self.assertEqual(summary["accounts_verified"], 0)
+        self.assertEqual(summary["projects_healthy"], 0)
+        self.assertIn("ACCOUNT_FAILED account-01", self.logs)
+
+    def test_expiry_window_warns_and_fails_after_queries(self):
+        today = datetime.date(2026, 12, 6)
+        for expires, warns in [("2026-12-20", True), ("2026-12-21", False), ("2026-12-01", True)]:
+            with self.subTest(expires=expires):
+                self.logs = []
+                summary, _ = m.run(self.fallback_config({"token": "sbp_fixture", "expires_at": expires}),
+                                   api=self.api, sleep=lambda _: None, emit=self.logs.append, today=today)
+                self.assertEqual(summary["projects_healthy"], 1)
+                self.assertEqual(summary["failures"], 1 if warns else 0)
+                days = (datetime.date.fromisoformat(expires) - today).days
+                self.assertEqual(f"TOKEN_EXPIRING account-01 slot-1 days={days}" in self.logs, warns)
+
+    def test_failure_logs_carry_ordinals_and_never_private_values(self):
+        cfg = config()
+        cfg["accounts"].insert(0, {"email": "second@example.invalid", "token": "sbp_second",
+                                   "expected_project_refs": [OTHER]})
+        cfg["expected_accounts"].append("second@example.invalid")
+        def api(token, path, payload=None, **kwargs):
+            if token == "sbp_second":
+                raise m.ApiError(503)
+            return self.api(token, path, payload, **kwargs)
+        summary, _ = self.execute(cfg, api)
+        self.assertIn("TOKEN_FAILED account-01 slot-1 http=503", self.logs)
+        self.assertIn("ACCOUNT_FAILED account-01", self.logs)
+        logs = "\n".join(self.logs)
+        for private in [REF, OTHER, EMAIL, "second@example.invalid", "sbp_second", "sbp_fixture"]:
+            self.assertNotIn(private, logs)
 
 
 if __name__ == "__main__":

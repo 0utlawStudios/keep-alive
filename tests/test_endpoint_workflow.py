@@ -1,6 +1,7 @@
 """Execute the actual workflow shell, replacing only curl with a deterministic stub."""
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -45,6 +46,7 @@ class EndpointWorkflowTests(unittest.TestCase):
         self.assertIn("--proto\n=https\n", files["curl-arguments"])
         self.assertNotIn("--location", files["curl-arguments"])
         self.assertIn("OK   target-1 -> HTTP 200", result.stdout)
+        self.assertIn("failures<<KEEPALIVE_FAILURES_EOF\nKEEPALIVE_FAILURES_EOF\n", files["output"])
 
     def test_redirects_errors_and_malformed_statuses_fail_closed(self):
         for code, exit_code, expected in [("302", 0, "302"), ("503", 0, "503"),
@@ -53,6 +55,8 @@ class EndpointWorkflowTests(unittest.TestCase):
                 _, files = self.run_workflow([self.target()], code, exit_code)
                 self.assertIn("had_failures=true", files["output"])
                 self.assertEqual(files["keepalive-failures.md"], f"- **target-1**: HTTP {expected}\n")
+                self.assertIn(f"failures<<KEEPALIVE_FAILURES_EOF\n- **target-1**: HTTP {expected}\n"
+                              "KEEPALIVE_FAILURES_EOF\n", files["output"])
 
     def test_malformed_secret_values_are_rejected_without_parser_disclosure(self):
         for change in [{"headers": PRIVATE}, {"headers": {"apikey": [PRIVATE]}},
@@ -64,6 +68,34 @@ class EndpointWorkflowTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("Invalid keep-alive target configuration", result.stdout)
                 self.assertEqual(files["curl-arguments"], "")
+
+
+class WorkflowPermissionTests(unittest.TestCase):
+    """Secrets and write permissions must never share a job."""
+
+    def jobs(self, name):
+        text = (Path(__file__).parents[1] / ".github/workflows" / name).read_text()
+        self.assertIn("\npermissions: {}\n", text)
+        body = text.split("\njobs:\n", 1)[1]
+        chunks = re.split(r"\n(?=  \S)", "\n" + body)[1:]
+        return {c.strip().split(":", 1)[0]: c for c in chunks}
+
+    def test_secret_jobs_hold_no_write_permission_and_writers_hold_no_secrets(self):
+        for name, secret_job in [("keep-alive.yml", "ping"), ("supabase-keepalive.yml", "keepalive")]:
+            with self.subTest(workflow=name):
+                jobs = self.jobs(name)
+                self.assertIn(secret_job, jobs)
+                for job, text in jobs.items():
+                    if job == secret_job:
+                        self.assertIn("secrets.", text)
+                        self.assertNotIn("write", text)
+                    else:
+                        self.assertNotIn("secrets.", text)
+
+    def test_only_one_workflow_commits_a_heartbeat(self):
+        root = Path(__file__).parents[1] / ".github/workflows"
+        self.assertNotIn("git push", (root / "keep-alive.yml").read_text())
+        self.assertIn("git push origin HEAD:main", (root / "supabase-keepalive.yml").read_text())
 
 
 if __name__ == "__main__":

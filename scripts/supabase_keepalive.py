@@ -2,7 +2,9 @@
 
 Credentials are read only from SUPABASE_KEEPALIVE_ACCOUNTS. Never print API
 response bodies, account emails, project names/references, or credential values.
+Accounts and tokens appear in logs only as ordinals (account-03 slot-2).
 """
+import datetime
 import hashlib
 import http.client
 import json
@@ -16,6 +18,10 @@ import urllib.request
 API = "https://api.supabase.com/v1"
 REF = re.compile(r"^[a-z]{20}$")
 QUERIES_PER_PROJECT = 3
+EXPIRY_WARNING_DAYS = 14
+TOKEN = re.compile(r"sbp_[A-Za-z0-9_]+")
+DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+STATUS = re.compile(r"^[A-Z_]{1,40}$")
 
 
 class ApiError(Exception):
@@ -76,8 +82,7 @@ def config_from_json(raw):
                 raise ValueError()
             if account["email"] not in expected or account["email"] in emails:
                 raise ValueError()
-            if not isinstance(account.get("token"), str) or not re.fullmatch(r"sbp_[A-Za-z0-9_]+", account["token"]):
-                raise ValueError()
+            account_tokens(account)
             refs = account.get("expected_project_refs")
             if (not isinstance(refs, list) or not refs
                     or any(not isinstance(ref, str) or not REF.fullmatch(ref) for ref in refs)
@@ -98,12 +103,42 @@ def config_from_json(raw):
         raise ValueError("Invalid or empty keep-alive configuration") from None
 
 
+def account_tokens(account):
+    """Normalize the legacy single `token` and the ordered `tokens` fallback list."""
+    if ("token" in account) == ("tokens" in account):
+        raise ValueError()
+    entries = [account["token"]] if "token" in account else account["tokens"]
+    if not isinstance(entries, list) or not entries:
+        raise ValueError()
+    normalized = []
+    for entry in entries:
+        if isinstance(entry, str):
+            entry = {"token": entry}
+        if not isinstance(entry, dict) or set(entry) - {"token", "expires_at"}:
+            raise ValueError()
+        token = entry.get("token")
+        if not isinstance(token, str) or not TOKEN.fullmatch(token):
+            raise ValueError()
+        expires = entry.get("expires_at")
+        if expires is not None:
+            if not isinstance(expires, str) or not DATE.fullmatch(expires):
+                raise ValueError()
+            expires = datetime.date.fromisoformat(expires)
+        normalized.append({"token": token, "expires_at": expires})
+    if len({entry["token"] for entry in normalized}) != len(normalized):
+        raise ValueError()
+    return normalized
+
+
 def label(value):
     return hashlib.sha256(value.encode()).hexdigest()[:12]
 
 
-def run(cfg, api=request, sleep=time.sleep, emit=print):
+def run(cfg, api=request, sleep=time.sleep, emit=print, today=None):
+    today = today or datetime.datetime.now(datetime.timezone.utc).date()
     results = []
+    tokens_expected = 0
+    tokens_verified = 0
     verified_accounts = set()
     seen = set()
     restore_attempted = set()
@@ -112,9 +147,25 @@ def run(cfg, api=request, sleep=time.sleep, emit=print):
 
     def record(kind, ref="", **details):
         results.append({"kind": kind, "ref": ref, **details})
-        # Only bounded program-owned enums and opaque hashes enter public logs.
-        suffix = " " + label(ref) if ref else ""
-        emit(kind.upper() + suffix)
+        # Only bounded program-owned enums, ordinals, HTTP codes and opaque
+        # hashes enter public logs.
+        parts = [kind.upper()]
+        if ref:
+            parts.append(label(ref))
+        if "account" in details:
+            parts.append(f"account-{details['account']:02d}")
+        if "slot" in details:
+            parts.append(f"slot-{details['slot']}")
+        if "http" in details:
+            parts.append(f"http={details['http']}")
+        if "days" in details:
+            parts.append(f"days={details['days']}")
+        if isinstance(details.get("status"), str) and STATUS.fullmatch(details["status"]):
+            parts.append(f"status={details['status']}")
+        emit(" ".join(parts))
+
+    def failure_code(error):
+        return error.status if isinstance(error, ApiError) else "invalid-response"
 
     def query(token, ref):
         # Supabase recommends a few user database requests each day. These
@@ -129,45 +180,71 @@ def run(cfg, api=request, sleep=time.sleep, emit=print):
         pending.pop(ref, None)
         record("healthy", ref)
 
-    for account in cfg["accounts"]:
-        token = account["token"]
+    for number, account in enumerate(cfg["accounts"], start=1):
         email = account["email"]
+        scoped = account.get("token_scope", "user") == "organization"
+        expected_orgs = set(account.get("organization_ids") or [])
+        token = None
+        # Every enrolled token is checked each run, so a dead fallback is
+        # reported long before it is needed. The first verified token works.
+        for slot, entry in enumerate(account_tokens(account), start=1):
+            tokens_expected += 1
+            where = {"account": number, "slot": slot}
+            if entry["expires_at"] is not None:
+                days = (entry["expires_at"] - today).days
+                if days <= EXPIRY_WARNING_DAYS:
+                    record("token_expiring", days=days, **where)
+            try:
+                if scoped:
+                    # Scoped tokens cannot call /profile. Their email-to-org binding
+                    # must be verified in the authenticated dashboard at enrollment.
+                    # Revalidate the exact organization scope before any project work.
+                    orgs = api(entry["token"], "/organizations")
+                    if (not isinstance(orgs, list)
+                            or any(not isinstance(o, dict) or not isinstance(o.get("id"), str) for o in orgs)
+                            or {o["id"] for o in orgs} != expected_orgs):
+                        record("scope_failed", **where)
+                        continue
+                else:
+                    profile = api(entry["token"], "/profile")
+                    if not isinstance(profile, dict) or profile.get("primary_email") != email:
+                        record("identity_failed", **where)
+                        continue
+            except ApiError as error:
+                record("token_dead" if error.status in (401, 403) else "token_failed",
+                       http=error.status, **where)
+                continue
+            except (ValueError, TypeError):
+                record("token_failed", http="invalid-response", **where)
+                continue
+            tokens_verified += 1
+            if token is None:
+                token = entry["token"]
+        if token is None:
+            record("account_failed", account=number)
+            continue
         try:
-            scoped = account.get("token_scope", "user") == "organization"
-            if scoped:
-                # Scoped tokens cannot call /profile. Their email-to-org binding
-                # must be verified in the authenticated dashboard at enrollment.
-                # Revalidate the exact organization scope before any project work.
-                expected_orgs = set(account["organization_ids"])
-                orgs = api(token, "/organizations")
-                if (not isinstance(orgs, list)
-                        or any(not isinstance(o, dict) or not isinstance(o.get("id"), str) for o in orgs)
-                        or {o["id"] for o in orgs} != expected_orgs):
-                    record("scope_failed")
-                    continue
-            else:
-                profile = api(token, "/profile")
-                if not isinstance(profile, dict) or profile.get("primary_email") != email:
-                    record("identity_failed")
-                    continue
             projects = api(token, "/projects")
             if not isinstance(projects, list):
-                record("discovery_failed")
+                record("discovery_failed", account=number)
                 continue
             if any(not isinstance(p, dict) or not isinstance(p.get("id"), str)
                    or not REF.fullmatch(p["id"]) or not isinstance(p.get("status"), str)
                    for p in projects):
-                record("discovery_failed")
+                record("discovery_failed", account=number)
                 continue
             if scoped and any(p.get("organization_id") not in expected_orgs for p in projects):
-                record("scope_failed")
+                record("scope_failed", account=number)
                 continue
             verified_accounts.add(email)
             discovered_refs = {project["id"] for project in projects}
             for ref in sorted(set(account["expected_project_refs"]) - discovered_refs):
-                record("project_missing", ref)
-        except (ApiError, ValueError, TypeError):
-            record("account_failed")
+                record("project_missing", ref, account=number)
+        except ApiError as error:
+            record("discovery_failed", account=number, http=error.status)
+            continue
+        except (ValueError, TypeError):
+            record("discovery_failed", account=number, http="invalid-response")
             continue
         for project in projects:
             ref = project["id"]
@@ -198,7 +275,7 @@ def run(cfg, api=request, sleep=time.sleep, emit=print):
                     continue
                 query(token, ref)
             except (ApiError, ValueError, TypeError) as error:
-                record("project_failed", ref, http=error.status if isinstance(error, ApiError) else "invalid-response")
+                record("project_failed", ref, http=failure_code(error))
             sleep(0.5)
     # Every already-healthy project is serviced before restoration polling.
     # One shared deadline bounds all transitional projects, not three minutes each.
@@ -222,7 +299,7 @@ def run(cfg, api=request, sleep=time.sleep, emit=print):
                     record("unhealthy", ref, status=status)
                     pending.pop(ref, None)
             except (ApiError, ValueError, TypeError) as error:
-                record("project_failed", ref, http=error.status if isinstance(error, ApiError) else "invalid-response")
+                record("project_failed", ref, http=failure_code(error))
                 pending.pop(ref, None)
     for ref in pending:
         record("unhealthy", ref, status="restore-verification-timeout")
@@ -234,6 +311,7 @@ def run(cfg, api=request, sleep=time.sleep, emit=print):
     failures = [r for r in results if r["kind"] not in ("healthy", "excluded", "restore_requested")
                 and not (r["kind"] != "project_missing" and r["ref"] and r["ref"] in recovered)]
     summary = {"accounts_verified": len(verified_accounts), "accounts_expected": len(cfg["expected_accounts"]),
+               "tokens_verified": tokens_verified, "tokens_expected": tokens_expected,
                "projects_healthy": len(recovered),
                "projects_excluded": len({r["ref"] for r in results if r["kind"] == "excluded"}),
                "failures": len(failures)}

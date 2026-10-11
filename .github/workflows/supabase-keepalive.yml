@@ -5,8 +5,7 @@ on:
     - cron: "17 11 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: supabase-keepalive
@@ -14,10 +13,12 @@ concurrency:
 
 jobs:
   keepalive:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Discover accounts and verify database activity
@@ -25,27 +26,81 @@ jobs:
           SUPABASE_KEEPALIVE_ACCOUNTS: ${{ secrets.SUPABASE_KEEPALIVE_ACCOUNTS }}
         run: python3 scripts/supabase_keepalive.py
 
-  heartbeat:
-    # Repository maintenance remains independent of failed database/API checks.
+  alert:
+    # Separate job: the only one with issue access never sees the account secret.
     needs: keepalive
-    if: always()
-    runs-on: ubuntu-latest
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open, update or close the failure issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RESULT: ${{ needs.keepalive.result }}
+        with:
+          script: |
+            const title = "Supabase keep-alive failed";
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const open = (await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner, repo: context.repo.repo, state: "open", per_page: 100,
+            })).filter((i) => i.title === title && !i.pull_request);
+            if (process.env.RESULT === "success") {
+              for (const issue of open) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: issue.number,
+                  body: `Recovered: every enrolled account, token and project passed in [run ${context.runId}](${run}).`,
+                });
+                await github.rest.issues.update({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: issue.number, state: "closed",
+                });
+              }
+              return;
+            }
+            const body = [
+              `The daily Supabase keep-alive did not pass (job result: ${process.env.RESULT}).`,
+              ``,
+              `Read the TOKEN_*, ACCOUNT_*, PROJECT_* and SUMMARY lines in the [run log](${run}).`,
+              `Lines name accounts and tokens by ordinal (account-03 slot-2) and projects by hash only.`,
+              `A free-tier project pauses after 7 days without activity.`,
+            ].join("\n");
+            if (open.length) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: open[0].number, body,
+              });
+            } else {
+              await github.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title, body });
+            }
+
+  heartbeat:
+    # The repository's only heartbeat. GitHub disables scheduled workflows after
+    # 60 days without commits; this runs even when the database checks fail.
+    needs: keepalive
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 3
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Keep scheduled workflows active
         shell: bash
         run: |
           set -euo pipefail
+          git fetch --quiet --depth=1 origin main
+          git reset --quiet --hard origin/main
           last=$(git log -1 --format=%ct)
           now=$(date +%s)
-          if [ $(( (now - last) / 86400 )) -ge 25 ]; then
+          age_days=$(( (now - last) / 86400 ))
+          if [ "$age_days" -ge 25 ]; then
             date -u +"%Y-%m-%dT%H:%M:%SZ" > last-heartbeat.txt
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add last-heartbeat.txt
             git commit -m "chore: keep-alive heartbeat [skip actions]"
-            git push
+            git push origin HEAD:main
+            echo "Heartbeat committed (last commit was ${age_days}d ago)."
+          else
+            echo "Last commit ${age_days}d ago (<25d); no heartbeat needed."
           fi

@@ -4,18 +4,17 @@ name: keep-alive
 # Targets + credentials come from encrypted Actions secrets, so this repo exposes
 # no URLs or keys. KEEPALIVE_TARGETS is the base list; KEEPALIVE_EXTRA_TARGETS is
 # merged in when present so new targets can be added without replacing the base.
-# Hardened: per-target retries, fail-loud, auto-opens a tracking issue, and a
-# monthly heartbeat commit so GitHub never auto-disables the schedule under its
-# 60-day dormancy rule.
+# Hardened: per-target retries, fail-loud, and a separate alert job that opens a
+# tracking issue on failure and closes it on recovery. The job holding the target
+# secrets has no repository permissions. The repository heartbeat lives in
+# supabase-keepalive.yml (daily), which keeps both schedules active.
 
 on:
   schedule:
     - cron: "7 12 */2 * *" # every other day at 12:07 UTC (inside Supabase's 7-day pause window)
   workflow_dispatch:
 
-permissions:
-  contents: write # heartbeat commit
-  issues: write # failure alert
+permissions: {}
 
 concurrency:
   group: keep-alive
@@ -23,11 +22,12 @@ concurrency:
 
 jobs:
   ping:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions: {}
+    outputs:
+      failures: ${{ steps.ping.outputs.failures }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-
       - name: Ping all keep-alive targets
         id: ping
         env:
@@ -99,6 +99,12 @@ jobs:
               echo "- **$name**: HTTP $code" >> "$failures_file"
             fi
           done
+          # Only ordinal labels and status codes leave this step.
+          {
+            echo "failures<<KEEPALIVE_FAILURES_EOF"
+            cat "$failures_file"
+            echo "KEEPALIVE_FAILURES_EOF"
+          } >> "$GITHUB_OUTPUT"
           if [ -s "$failures_file" ]; then
             echo "had_failures=true" >> "$GITHUB_OUTPUT"
           else
@@ -106,58 +112,59 @@ jobs:
             echo "All targets healthy."
           fi
 
-      - name: Monthly heartbeat commit (dodge 60-day auto-disable)
-        if: always()
-        run: |
-          set -euo pipefail
-          last=$(git log -1 --format=%ct 2>/dev/null || echo 0)
-          now=$(date +%s)
-          age_days=$(( (now - last) / 86400 ))
-          if [ "$age_days" -ge 25 ]; then
-            date -u +"%Y-%m-%dT%H:%M:%SZ" > last-heartbeat.txt
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add last-heartbeat.txt
-            git commit -m "chore: keep-alive heartbeat [skip actions]"
-            git push
-            echo "Heartbeat committed (last commit was ${age_days}d ago)."
-          else
-            echo "Last commit ${age_days}d ago (<25d); no heartbeat needed."
-          fi
-
-      - name: Open or update a tracking issue if any target failed
+      - name: Fail the run if any target failed
         if: ${{ !cancelled() && steps.ping.outputs.had_failures == 'true' }}
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        run: |
+          echo "::error::One or more keep-alive targets failed (see the tracking issue and logs above)"
+          exit 1
+
+  alert:
+    # Runs after every finished ping, including a timeout, so no failure goes unreported.
+    needs: ping
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open, update or close the tracking issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RESULT: ${{ needs.ping.result }}
+          FAILURES: ${{ needs.ping.outputs.failures }}
         with:
           script: |
-            const fs = require('fs');
-            const path = require('path');
-            const failures = fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'keepalive-failures.md'), 'utf8').trim();
             const title = "Keep-alive ping failed";
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const open = (await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner, repo: context.repo.repo, state: "open", per_page: 100,
+            })).filter((i) => i.title === title && !i.pull_request);
+            if (process.env.RESULT === "success") {
+              for (const issue of open) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: issue.number,
+                  body: `Recovered: every target returned HTTP 2xx in [run ${context.runId}](${run}).`,
+                });
+                await github.rest.issues.update({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: issue.number, state: "closed",
+                });
+              }
+              return;
+            }
+            const failures = (process.env.FAILURES || "").trim()
+              || `The ping job did not finish (job result: ${process.env.RESULT}).`;
             const body = [
               `One or more keep-alive targets failed (run ${context.runId}).`,
               ``,
               failures,
               ``,
               `A free-tier Supabase project pauses after ~7 days with no activity. Investigate before the window closes.`,
-              `[Run logs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              `[Run logs](${run})`,
             ].join("\n");
-            const open = await github.paginate(github.rest.issues.listForRepo, {
-              owner: context.repo.owner, repo: context.repo.repo, state: "open", per_page: 100,
-            });
-            const existing = open.find((i) => i.title === title && !i.pull_request);
-            if (existing) {
+            if (open.length) {
               await github.rest.issues.createComment({
-                owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number, body,
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: open[0].number, body,
               });
             } else {
-              await github.rest.issues.create({
-                owner: context.repo.owner, repo: context.repo.repo, title, body,
-              });
+              await github.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title, body });
             }
-
-      - name: Fail the run if any target failed
-        if: ${{ !cancelled() && steps.ping.outputs.had_failures == 'true' }}
-        run: |
-          echo "::error::One or more keep-alive targets failed (see the tracking issue and logs above)"
-          exit 1
